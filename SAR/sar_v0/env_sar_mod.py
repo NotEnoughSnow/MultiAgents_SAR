@@ -67,9 +67,9 @@ from gymnasium.utils import EzPickle
 
 from pettingzoo.mpe._mpe_utils.core import Agent, Landmark, World
 from pettingzoo.mpe._mpe_utils.scenario import BaseScenario
-from pettingzoo.mpe._mpe_utils.simple_env import SimpleEnv, make_env
+from SAR.sar_v0.simple_env_mod import SimpleEnv, make_env
 from pettingzoo.utils.conversions import parallel_wrapper_fn
-
+from gymnasium.utils import seeding
 
 class raw_env(SimpleEnv, EzPickle):
     def __init__(
@@ -103,6 +103,8 @@ class raw_env(SimpleEnv, EzPickle):
         self.metadata["name"] = "simple_sar_v0"
 
 
+
+
 env = make_env(raw_env)
 parallel_env = parallel_wrapper_fn(env)
 
@@ -124,7 +126,7 @@ class Scenario(BaseScenario):
             agent.name = "agent %d" % i
             agent.collide = True
             agent.silent = True
-            agent.size = 0.05
+            agent.size = 0.02
             agent.accel = 4.0
             agent.max_speed = 1.3
         # add landmarks
@@ -133,18 +135,16 @@ class Scenario(BaseScenario):
             landmark.hostage = True if i < num_hostages else False
             base_name = "hostage" if landmark.hostage else "goal"
             base_index = i if i < num_hostages else i - num_hostages
-            agent.name = f"{base_name}_{base_index}"
+            landmark.name = f"{base_name}_{base_index}"
 
             landmark.collide = True
             landmark.movable = False
-            landmark.size = 0.05 if not landmark.hostage else 0.15
+            landmark.size = 0.02 if landmark.hostage else 0.05
             landmark.boundary = False
-        return world
 
-    def reset_world(self, world, np_random):
         # random properties for agents
         for i, agent in enumerate(world.agents):
-            agent.color = (np.array([1, 0, 1]))
+            agent.color = (np.array([1, 1, 1]))
         # random properties for landmarks
         for i, landmark in enumerate(world.landmarks):
             landmark.color = (
@@ -152,11 +152,17 @@ class Scenario(BaseScenario):
                 if not landmark.hostage
                 else np.array([1, 1, 0])
             )
+
+        self._seed()
+        return world
+
+    def reset_world(self, world, np_random):
         # set random initial states
         for agent in world.agents:
             agent.state.p_pos = np_random.uniform(-0.3, +0.3, world.dim_p)
             agent.state.p_vel = np.zeros(world.dim_p)
             agent.state.c = np.zeros(world.dim_c)
+            agent.active = False
         for i, landmark in enumerate(world.landmarks):
             if not landmark.boundary:
                 landmark.state.p_pos = np_random.uniform(-1, +1, world.dim_p)
@@ -197,6 +203,8 @@ class Scenario(BaseScenario):
         # Returns the rewards for the agents
         return self.agent_reward(agent, world)
 
+    def _seed(self, seed=None):
+        self.np_random, seed = seeding.np_random(seed)
 
     def agent_reward(self, agent, world):
         # Agents are rewarded for reaching a hostage and for delivering it to a goal zone
@@ -206,40 +214,109 @@ class Scenario(BaseScenario):
         hostages = self.hostages(world)
         goals = self.goals(world)
 
+        entities_in_range = agent.entities_in_range
+
+        if agent.active:
+            agent.color = (np.array([1, 0, 1]))
+        else:
+            agent.color = (np.array([1, 1, 1]))
+
         if agent.collide:
-            for ag in agents:
-                for hsg in hostages:
-                    if self.is_collision(ag, hsg) and not agent.active:
-                        rew += 10
-                        agent.active = True
-                for gl in goals:
-                    # TODO : limit the reward to activation
-                    if self.is_collision(ag, gl) and agent.active:
-                        rew += 40
+            for hsg in hostages:
+                if self.is_collision(agent, hsg) and not agent.active:
+                    # if agent collides with any hostage
+                    rew += 100
+                    agent.active = True
+                    #self.reset_world(world,self.np_random)
+            for gl in goals:
+                if self.is_collision(agent, gl) and agent.active:
+                    # if agent collides with any goal
+                    rew += 300
+
+        #print(agent.last_pos - agent.state.p_pos)
+        #print("current :", agent.state.p_pos)
+        #print("found stored :", agent.last_pos)
+
+
+        #pygame.draw.circle(screen, (255, 0, 0), (-50, 300), 5)
+
+
+        for ent in entities_in_range:
+            if ent.hostage:
+                x = self.heuristic(ent.state.p_pos, agent.state.p_pos)
+
+                #print("for")
+                #print("x :", x)
+                #y = 1/3 * np.exp(-(1/3) * x + 2) (4)
+                #y = 1/4 * np.exp(-(1/4) * x + 2) (5,6)
+                #y = 1/4 * np.exp(-(1/2) * x + 3) (7)
+                # y = 1/5 * np.exp(-(1/5) * x + 2) (8)
+                #y = np.exp(-1 * x + 2) - 3
+                #y = 1/4 * np.exp(-1 * x + 3) (10)
+                #y = 1/4 * np.exp(-1 * x + 3)
+                #y = np.exp(-1 * x + 3)
+                y = (1/4) * np.exp(-1 * x + 3)
+
+                #y = - np.sqrt(x) + 1.5
+
+                d = 3*(0.5-x)
+                #agent.color = (np.array([c, c, c]))
+                #print("for :",x)
+                #print("color :", c)
+
+                #print("y :", y)
+                rew += d
+
+        #rew -= 0.5
+
+        # agents are penalized for exiting the screen, so that they can be caught by the adversaries
+        def bound(x):
+            if x < 0.9:
+                return 0
+            if x < 1.0:
+                return (x - 0.9) * 10
+            return min(np.exp(2 * x - 2), 10)
+
+        for p in range(world.dim_p):
+            x = abs(agent.state.p_pos[p])
+            rew -= bound(x)
 
         return rew
 
+    def heuristic(self, pos1, pos2):
+        delta_pos = pos1 - pos2
+        return np.sqrt(np.sum(np.square(delta_pos)))
+
+
     def observation(self, agent, world):
+
+
+        hostages = self.hostages(world)
+        goals = self.goals(world)
+
         # get positions of all entities in this agent's reference frame
         entity_pos = []
+        entity_list = []
         for entity in world.landmarks:
             if not entity.boundary:
-                entity_pos.append(entity.state.p_pos - agent.state.p_pos)
+                entity_list.append(entity)
+                entity_pos.append(entity.state.p_pos)
+
+        agent.entities_in_range = entity_list
+
         # communication of all other agents
-        comm = []
-        other_pos = []
-        other_vel = []
-        for other in world.agents:
-            if other is agent:
-                continue
-            comm.append(other.state.c)
-            other_pos.append(other.state.p_pos - agent.state.p_pos)
+        #comm = []
+        #other_pos = []
+        #other_vel = []
+        #for other in world.agents:
+        #    if other is agent:
+        #        continue
+        #    comm.append(other.state.c)
+        #    other_pos.append(other.state.p_pos - agent.state.p_pos)
             #if not other.adversary:
             #    other_vel.append(other.state.p_vel)
         return np.concatenate(
             [agent.state.p_vel]
             + [agent.state.p_pos]
             + entity_pos
-            + other_pos
-            + other_vel
         )
